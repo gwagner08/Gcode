@@ -1,0 +1,376 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Cobrand Song Analytics Scraper — final robust version
+
+Usage:
+  python cobrand_scrape.py --artist "YUNGBLUD" --top 5 --no-headless
+
+.env (no quotes):
+  COBRAND_USER=you@example.com
+  COBRAND_PASS=your_password
+"""
+
+import os, re, sys, time, logging, argparse
+from dataclasses import dataclass
+from pathlib import Path
+from typing import List
+from urllib.parse import urlparse
+
+import pandas as pd
+from dotenv import load_dotenv
+
+from selenium import webdriver
+from selenium.webdriver.chrome.service import Service
+from webdriver_manager.chrome import ChromeDriverManager
+from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
+from selenium.webdriver.common.action_chains import ActionChains
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import TimeoutException
+
+# ────────────────────────── Logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)],
+)
+log = logging.getLogger("cobrand")
+
+# ────────────────────────── Utilities
+def save_artifacts(drv, name: str):
+    Path("artifacts").mkdir(exist_ok=True)
+    try: drv.save_screenshot(f"artifacts/{name}.png")
+    except Exception: pass
+    try: Path(f"artifacts/{name}.html").write_text(drv.page_source, encoding="utf-8")
+    except Exception: pass
+    log.info("Saved artifacts: artifacts/%s.(png|html)", name)
+
+def waitx(drv, step: str, by, sel: str, t=30):
+    try:
+        log.info("WAIT  %-22s  %s  %s", step, getattr(by, "__name__", by), sel)
+        return WebDriverWait(drv, t).until(EC.visibility_of_element_located((by, sel)))
+    except Exception:
+        log.error("TIMEOUT at step: %s", step)
+        save_artifacts(drv, f"{step}_FAIL")
+        raise
+
+def page_ready(drv, t=45):
+    WebDriverWait(drv, t).until(lambda d: d.execute_script("return document.readyState") == "complete")
+
+def js_click(drv, el):
+    drv.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
+    drv.execute_script("arguments[0].click();", el)
+
+def click_like_human(drv, el):
+    drv.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
+    ActionChains(drv).move_to_element(el).pause(0.05).click().perform()
+
+def _force_click(drv, el):
+    # try normal click
+    try:
+        click_like_human(drv, el); return
+    except Exception:
+        pass
+    # click closest clickable ancestor
+    wrapper = drv.execute_script(
+        "return arguments[0].closest('button,[role=\"option\"],[role=\"menuitem\"],li,div');", el
+    ) or el
+    try:
+        click_like_human(drv, wrapper); return
+    except Exception:
+        pass
+    # pointer event burst
+    drv.execute_script("""
+      const el = arguments[0];
+      const r = el.getBoundingClientRect();
+      const cx = r.left + r.width/2, cy = r.top + r.height/2;
+      for (const t of ['pointerdown','mousedown','pointerup','mouseup','click']) {
+        el.dispatchEvent(new MouseEvent(t, {bubbles:true, cancelable:true, clientX: cx, clientY: cy}));
+      }
+    """, wrapper)
+
+def current_origin(drv) -> str:
+    u = urlparse(drv.current_url)
+    return f"{u.scheme}://{u.netloc}" if u.netloc else "https://music.cobrand.com"
+
+# ────────────────────────── WebDriver
+def build_driver(headless=True):
+    opts = webdriver.ChromeOptions()
+    if headless: opts.add_argument("--headless=new")
+    opts.add_argument("--window-size=1400,1000")
+    opts.add_argument("--disable-gpu"); opts.add_argument("--no-sandbox"); opts.add_argument("--disable-dev-shm-usage")
+    opts.add_experimental_option("excludeSwitches", ["enable-automation"])
+    opts.add_experimental_option("useAutomationExtension", False)
+    drv = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=opts)
+    drv.set_page_load_timeout(60)
+    return drv
+
+# ────────────────────────── Login
+def login_via_auth0(drv, user, pw):
+    log.info("Opening cobrand.com…")
+    drv.get("https://cobrand.com/")
+    page_ready(drv)
+
+    # Click “Sign In” or follow direct Auth0 link
+    try:
+        sign_in = waitx(drv, "login_signin_link", By.XPATH,
+            "//a[normalize-space(.)='Sign In' or contains(translate(.,'SIGNIN','signin'),'sign in')]", 25)
+        js_click(drv, sign_in)
+    except Exception:
+        links = [a.get_attribute("href") or "" for a in drv.find_elements(By.TAG_NAME, "a")]
+        auth = next((u for u in links if "auth0" in u or "/u/login" in u), None)
+        if auth: drv.get(auth)
+
+    email  = waitx(drv, "login_email",    By.CSS_SELECTOR, "input[type='email'],input[name='username'],#username", 40)
+    email.clear(); email.send_keys(user)
+    pw_box = waitx(drv, "login_password", By.CSS_SELECTOR, "input[type='password'],input[name='password'],#password", 40)
+    pw_box.clear(); pw_box.send_keys(pw)
+    submit = waitx(drv, "login_submit",   By.CSS_SELECTOR, "button[type='submit']", 30)
+    js_click(drv, submit)
+
+    WebDriverWait(drv, 60).until(lambda d: "auth0" not in d.current_url)
+    page_ready(drv)
+    save_artifacts(drv, "after_login")
+    log.info("Logged in → %s", drv.current_url)
+
+# ────────────────────────── Navigation
+def _on_song_analytics(drv) -> bool:
+    markers = [
+        "//input[contains(@placeholder,'Search') and not(@type='email') and not(@type='password')]",
+        "//span[normalize-space(.)='By Song Title' or normalize-space(.)='By Artist Name']",
+        "//span[starts-with(normalize-space(),'Creates:')]",
+    ]
+    return any(drv.find_elements(By.XPATH, xp) for xp in markers)
+
+def goto_song_analytics(drv):
+    page_ready(drv)
+    origin = current_origin(drv)
+
+    # Direct routes first
+    for path in ["/songs/", "/catalog/song-analytics", "/analytics/songs", "/songs"]:
+        drv.get(origin + path); page_ready(drv); time.sleep(0.4)
+        if _on_song_analytics(drv):
+            save_artifacts(drv, "after_nav"); return
+
+    # Sidebar fallback
+    try:
+        waitx(drv, "nav_sidebar", By.XPATH, "//nav", 20)
+        for xp in [
+            "//nav//a[contains(@href,'/songs')][1]",
+            "//nav//a[normalize-space(.)='Catalog']",
+            "//aside//a[normalize-space(.)='Catalog']",
+        ]:
+            els = drv.find_elements(By.XPATH, xp)
+            if not els: continue
+            js_click(drv, els[0]); page_ready(drv); time.sleep(0.6)
+            if _on_song_analytics(drv):
+                save_artifacts(drv, "after_nav_sidebar"); return
+    except Exception:
+        pass
+
+    save_artifacts(drv, "after_nav_FAIL")
+    raise TimeoutException("Could not open Song Analytics view.")
+
+# ────────────────────────── Dropdowns (flex + span)
+def _find_visible_by_text(drv, text, timeout=10):
+    xp = (
+        f"//*[normalize-space(text())='{text}' "
+        f" and not(ancestor-or-self::*[@aria-hidden='true']) "
+        f" and not(ancestor-or-self::*[contains(@style,'display: none') or contains(@class,'hidden')])]"
+    )
+    return WebDriverWait(drv, timeout).until(
+        lambda d: next((el for el in d.find_elements(By.XPATH, xp) if el.is_displayed()), None)
+    )
+
+def click_dropdown_flex_option(drv, step_prefix: str, trigger_label: str, option_label: str):
+    trigger = waitx(drv, f"{step_prefix}_trigger", By.XPATH,
+        f"//div[contains(@class,'flex') and .//span[normalize-space(text())='{trigger_label}']]", 20)
+    js_click(drv, trigger); time.sleep(0.25)
+
+    # Prefer the flex wrapper containing the label
+    candidates = drv.find_elements(
+        By.XPATH, f"//div[contains(@class,'flex') and .//span[normalize-space(text())='{option_label}']]"
+    )
+    option = next((el for el in candidates if el.is_displayed()), None)
+    if not option:
+        option = _find_visible_by_text(drv, option_label, timeout=8)
+
+    _force_click(drv, option); time.sleep(0.35)
+
+# ────────────────────────── Filters
+def ensure_all_songs(drv):
+    try:
+        el = drv.find_element(By.XPATH, "//*[self::button or self::div][normalize-space(.)='All Songs']")
+        click_like_human(drv, el); time.sleep(0.2)
+    except Exception:
+        pass
+
+def set_mode_by_artist_name(drv):
+    # pill label toggles between "By Song Title" and "By Artist Name"; open on whatever is shown
+    current = "By Song Title" if drv.find_elements(By.XPATH, "//span[normalize-space(.)='By Song Title']") else "By Artist Name"
+    click_dropdown_flex_option(drv, "mode", current, "By Artist Name")
+    waitx(drv, "mode_verify", By.XPATH, "//span[normalize-space(.)='By Artist Name']", 12)
+    save_artifacts(drv, "after_mode_artistname")
+    log.info("Mode switched → By Artist Name")
+
+def set_creates_7d(drv):
+    # pill starts as "Creates: 24 hours" or similar; open by the Creates: prefix
+    trigger = waitx(drv, "creates_trigger", By.XPATH,
+        "//div[contains(@class,'flex') and .//span[starts-with(normalize-space(),'Creates:')]]", 20)
+    js_click(drv, trigger); time.sleep(0.25)
+
+    opt = waitx(drv, "creates_option_7d", By.XPATH,
+        "//div[contains(@class,'flex') and .//span[normalize-space(.)='7 days']]", 12)
+    _force_click(drv, opt); time.sleep(0.35)
+
+    waitx(drv, "creates_verify_7d", By.XPATH,
+        "//span[contains(normalize-space(.),'Creates:') and contains(.,'7')]", 12)
+    save_artifacts(drv, "after_creates_7d")
+    log.info("Creates filter → 7 days")
+
+def select_artist(drv, artist: str):
+    for xp in [
+        "//input[contains(@placeholder,'artist') or contains(@placeholder,'artist name')]",
+        "//input[contains(@placeholder,'Search') and not(@type='email') and not(@type='password')]",
+    ]:
+        els = drv.find_elements(By.XPATH, xp)
+        if els:
+            box = els[0]
+            box.clear(); box.send_keys(artist); box.send_keys(Keys.ENTER)
+            time.sleep(1.2)
+            save_artifacts(drv, "after_artist_search")
+            log.info("Artist searched: %s", artist)
+            return
+    save_artifacts(drv, "artist_search_FAIL")
+    raise TimeoutException("Could not find the artist search input.")
+
+# ────────────────────────── Sorting
+def sort_by_creates_7d_desc(drv):
+    targets = [
+        "//th[.//div[normalize-space(.)='Creates (7d)']]",
+        "//div[normalize-space(.)='Creates (7d)']",
+        "//button[normalize-space(.)='Creates (7d)']",
+    ]
+    header = None
+    for xp in targets:
+        els = drv.find_elements(By.XPATH, xp)
+        if els: header = els[0]; break
+    if not header:
+        save_artifacts(drv, "sort_header_NOT_FOUND")
+        log.warning("Could not locate 'Creates (7d)' header; skipping explicit sort.")
+        return
+    click_like_human(drv, header); time.sleep(0.35)
+    click_like_human(drv, header); time.sleep(0.35)
+    save_artifacts(drv, "after_sort")
+    log.info("Sorted by Creates (7d) DESC")
+
+# ────────────────────────── Extraction
+@dataclass
+class SongRow:
+    artist: str
+    song: str
+    creates_total: str
+    growth: str
+    creates_period: int
+
+def extract_rows(drv, limit=50) -> List[SongRow]:
+    rows = drv.find_elements(
+        By.XPATH,
+        "//main//tbody/tr[.//a] | //main//*[@role='row' and .//a]"
+    )
+    out: List[SongRow] = []
+    for r in rows:
+        try:
+            a = r.find_element(By.XPATH, ".//a[1]")
+            song = (a.text or "").strip()
+            if not song: continue
+        except Exception:
+            continue
+
+        artist = ""
+        for xp in [
+            ".//a[1]/following::*[self::div or self::span][1]",
+            ".//*[contains(@class,'text-slate') or contains(@class,'text-gray')][1]",
+            ".//small[1]",
+        ]:
+            try:
+                artist = r.find_element(By.XPATH, xp).text.strip()
+                if artist: break
+            except Exception:
+                pass
+
+        txt = r.text or ""
+        nums = re.findall(r"\d{1,3}(?:,\d{3})+", txt)
+        perc = re.findall(r"[+−-]?\d+%|↑\d+%", txt)
+        period_val = int(nums[-1].replace(",", "")) if nums else 0
+        lifetime = nums[-2] if len(nums) >= 2 else (nums[0] if nums else "")
+        growth = (perc[-1].replace("↑", "") if perc else "")
+
+        if period_val > 0:
+            out.append(SongRow(artist=artist, song=song,
+                               creates_total=lifetime, growth=growth,
+                               creates_period=period_val))
+        if len(out) >= limit: break
+
+    if not out: save_artifacts(drv, "extract_no_rows")
+    else: save_artifacts(drv, "after_extract")
+    return out
+
+# ────────────────────────── Main
+def main():
+    load_dotenv()
+    ap = argparse.ArgumentParser(description="Cobrand Song Analytics Scraper")
+    ap.add_argument("--artist", required=True, help="Artist to search (e.g., 'YUNGBLUD')")
+    ap.add_argument("--top", type=int, default=5, help="Top N rows to output")
+    ap.add_argument("--out", default=None, help="Optional CSV path")
+    ap.add_argument("--no-headless", action="store_true", help="Show Chrome UI")
+    args = ap.parse_args()
+
+    user, pw = os.getenv("COBRAND_USER"), os.getenv("COBRAND_PASS")
+    if not user or not pw:
+        log.error("Add COBRAND_USER and COBRAND_PASS to a .env file (no quotes).")
+        sys.exit(2)
+
+    drv = build_driver(headless=not args.no_headless)
+    try:
+        login_via_auth0(drv, user, pw)
+        goto_song_analytics(drv)
+
+        ensure_all_songs(drv)
+        set_mode_by_artist_name(drv)
+        set_creates_7d(drv)
+        select_artist(drv, args.artist)
+        sort_by_creates_7d_desc(drv)
+
+        rows = extract_rows(drv, limit=max(20, args.top * 3))
+        if not rows:
+            log.error("No rows with non-zero period creates. See artifacts/* for clues.")
+            sys.exit(1)
+
+        rows = sorted(rows, key=lambda r: r.creates_period, reverse=True)[:args.top]
+        df = pd.DataFrame([{
+            "Artist Name": r.artist or args.artist,
+            "Song Title": r.song,
+            "Creates (Lifetime)": r.creates_total,
+            "% Growth": r.growth,
+            "Creates (7d)": r.creates_period,
+        } for r in rows])
+
+        print(f"\nTop {args.top} songs for {args.artist} (Creates 7d):\n")
+        print(df.to_string(index=False))
+
+        if args.out:
+            Path(args.out).parent.mkdir(parents=True, exist_ok=True)
+            df.to_csv(args.out, index=False)
+            print(f"\nSaved CSV → {args.out}")
+
+    finally:
+        save_artifacts(drv, "final_state")
+        drv.quit()
+
+if __name__ == "__main__":
+    main()
+
+
